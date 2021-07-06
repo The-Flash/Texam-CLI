@@ -1,0 +1,2 @@
+import libtexam
+libtexam.main()
