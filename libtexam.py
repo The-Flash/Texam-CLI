@@ -6,11 +6,15 @@ import pathlib
 import hashlib
 import zlib
 import glob
+import getpass
 
+REPO_NAME = ".texam"
 OBJECTS_DIR = pathlib.Path(".texam/objects")
+HEAD_FILE = pathlib.Path(".texam/HEAD")
+CONFIG_FILE = pathlib.Path(".texam/config")
 
 class TexamRepo:
-    repo_name = ".texam"
+    repo_name = REPO_NAME
     head_name = "master"
     def __init__(self, path=".", username=None, password=None, test_id=None):
         self.path = pathlib.Path(path) # represents the worktree
@@ -62,25 +66,26 @@ class TexamRepo:
     def repo_file(self, *path):
         return str(self.repo_dir.joinpath(*path))
 
-    def write_tree(self, path):
-        tree_entries = []
-        pattern = pathlib.Path(path) / "**" / "*.*"
-        # for file in gl
-        for file in glob.iglob(str(pattern), recursive=True):
-            print(file)
+def read_config(path=CONFIG_FILE):
+    config = {}
+    conf = configparser.ConfigParser()
+    conf.read(path)
+    config["username"] = conf["user"]["username"]
+    config["test_id"] = conf["test-details"]["test-id"]
+    return config
 
 def hash_object(data, obj_type, write=True):
         """
         Compute hash of object
         """
-        header = "{} {}".format(obj_type, len(data)).encode()
+        header = "{}".format(obj_type).encode()
         full_data = header + b'\x00' + data
         sha1 = hashlib.sha1(full_data).hexdigest()
         if write:
             dir = OBJECTS_DIR / sha1[:2]
             path = dir / sha1[2:]
             if not path.exists():
-                dir.mkdir(exist_ok=True)
+                os.makedirs(os.path.dirname(str(path)), exist_ok=True)
                 with open(path, "wb") as f:
                     f.write(zlib.compress(full_data))
         return sha1
@@ -93,6 +98,34 @@ def write_blob(path):
         data = f.read()
         return hash_object(data, "blob")
 
+def find_blob(hash):
+    if not OBJECTS_DIR.exists():
+        raise Exception("Invalid Texam Repo")
+    parent = OBJECTS_DIR /hash[:2]
+    input_path = parent / hash[2:]
+    if len(hash) < 5:
+        return None
+    if not parent.exists():
+        return None
+    for file in parent.iterdir():
+        if str(file).startswith(str(input_path)):
+            return file
+    return None
+
+def read_blob(hash):
+    blob = find_blob(hash)
+    if blob is None:
+        raise Exception("Blob not found")
+    with open(blob, "rb") as f:
+        data = f.read()
+        full_data = zlib.decompress(data)
+        i = full_data.find(b"\x00")
+        header = full_data[:i]
+        if header != b"blob":
+            raise Exception("Not a blob")
+        data = full_data[i+1:]
+        return data
+
 def write_blobs(path):
     path = pathlib.Path(path)
     if not path.is_dir():
@@ -100,6 +133,37 @@ def write_blobs(path):
     pattern = path / "**" / "*.*"
     for file in glob.iglob(str(pattern), recursive=True):
             write_blob(file)
+
+def write_tree(path=".", write=True):
+    """
+    1. Create blobs for all files in the worktree
+    2. Create a tree mapping a blob to a file
+    """
+    if not OBJECTS_DIR.exists():
+        raise Exception("Invalid Texam Repo")
+    tree_entries = []
+    config = read_config()
+    AUTHOR = "Author {}".format(config["username"])
+    HOST = "HOST {}".format(getpass.getuser())
+    header = "{}\n{}".format(AUTHOR, HOST)
+    pattern = pathlib.Path(path) / "**" / "*.*"
+    for file in glob.iglob(str(pattern), recursive=True):
+        hash = write_blob(file)
+        start = "blob {}".format(hash)
+        entry = start + "\x00" + file
+        tree_entries.append(entry)
+    data = "\n".join(tree_entries)
+    full_data = "{}\n{}".format(header, data).encode()
+    sha1 = hashlib.sha1(full_data).hexdigest()
+    if write:
+        dir = OBJECTS_DIR / sha1[:2]
+        path = dir / sha1[2:]
+        if not path.exists():
+            os.makedirs(os.path.dirname(str(path)), exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(zlib.compress(full_data))
+    return sha1
+
 
 argparser = argparse.ArgumentParser(description="CLI for Texam Software")
 argsubparsers = argparser.add_subparsers(title="Commands", dest="command")
@@ -120,6 +184,16 @@ argsp.add_argument("path",
 )
 # argsp.add_argument("add-path", metavar="file", default=".")
 argsp = argsubparsers.add_parser("commit")
+argsp.add_argument("path", 
+    metavar="directory", 
+    default=".", 
+    nargs="?"
+)
+argsp = argsubparsers.add_parser("cat-file")
+argsp.add_argument("hash", 
+    metavar="hash", 
+    nargs="?"
+)
 argsp = argsubparsers.add_parser("push")
 argsp = argsubparsers.add_parser("ls-tree")
 
@@ -128,16 +202,28 @@ def cmd_init(args):
     repo.initialize()
     print("Initialized empty Git repository in {}".format(repo.path.absolute()))
 
-def cmd_add(args):
-    path = pathlib.Path(args.path)
-    if path.is_dir():
-        write_blobs(path)
-    elif path.is_file():
-        write_blob(path)
-    else:
-        raise Exception("Not supported")
-    
+def cmd_commit(args):
+    tree_hash = write_tree(args.path)
+    with open(HEAD_FILE, "w") as f:
+        f.write(tree_hash)
+        print("Changes have been committed")
 
+def cmd_ls_tree():
+    if not HEAD_FILE.exists():
+        raise Exception("Invalid Texam Repo")
+    with open(HEAD_FILE, "r") as f:
+        current_tree = f.read()
+    tree_path = OBJECTS_DIR / current_tree[:2] / current_tree[2:]
+    with open(tree_path, "rb") as f:
+        tree = zlib.decompress(f.read()).decode()
+        sys.stdout.write(tree)
+
+def cmd_cat_file(args):
+    print(read_blob(args.hash))
+        
+def cmd_push(args):
+    pass
+    
 def main(argv=sys.argv[1:]):
     args = argparser.parse_args(argv)
     if args.command == "init":
@@ -145,8 +231,11 @@ def main(argv=sys.argv[1:]):
     elif args.command == "add":
         cmd_add(args)
     elif args.command == "commit":
-        print("Creating a commit object")
+        cmd_commit(args)
+    elif args.command == "cat-file":
+        cmd_cat_file(args)
     elif args.command == "push":
         print("Pushing to a remote server")
+        cmd_push(args)
     elif args.command == "ls-tree":
-        print("Listing tree of a commit")
+        cmd_ls_tree()
