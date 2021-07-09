@@ -78,8 +78,11 @@ def hash_object(data, obj_type, write=True):
         """
         Compute hash of object
         """
-        header = "{}".format(obj_type).encode()
-        full_data = header + b'\x00' + data
+        if len(obj_type) == 0:
+            full_data = data
+        else:
+            header = "{}".format(obj_type).encode()
+            full_data = header + b'\x00' + data
         sha1 = hashlib.sha1(full_data).hexdigest()
         if write:
             dir = OBJECTS_DIR / sha1[:2]
@@ -134,36 +137,58 @@ def write_blobs(path):
     for file in glob.iglob(str(pattern), recursive=True):
             write_blob(file)
 
-def write_tree(path=".", write=True):
-    """
-    1. Create blobs for all files in the worktree
-    2. Create a tree mapping a blob to a file
-    """
-    if not OBJECTS_DIR.exists():
-        raise Exception("Invalid Texam Repo")
-    tree_entries = []
-    config = read_config()
-    AUTHOR = "Author {}".format(config["username"])
-    HOST = "HOST {}".format(getpass.getuser())
-    header = "{}\n{}".format(AUTHOR, HOST)
-    pattern = pathlib.Path(path) / "**" / "*.*"
-    for file in glob.iglob(str(pattern), recursive=True):
-        hash = write_blob(file)
-        start = "blob {}".format(hash)
-        entry = start + "\x00" + file
-        tree_entries.append(entry)
-    data = "\n".join(tree_entries)
-    full_data = "{}\n{}".format(header, data).encode()
-    sha1 = hashlib.sha1(full_data).hexdigest()
-    if write:
-        dir = OBJECTS_DIR / sha1[:2]
-        path = dir / sha1[2:]
-        if not path.exists():
-            os.makedirs(os.path.dirname(str(path)), exist_ok=True)
-            with open(path, "wb") as f:
-                f.write(zlib.compress(full_data))
-    return sha1
+# graph = {}
+# def build_graph(directory="."):
+#     def inner():
+#         path = pathlib.Path(directory)
+#         graph[str(path)] = []
+#         for p in path.iterdir():
+#             graph[str(directory)].append(str(p))
+#             if p.is_dir():
+#                 build_graph(str(p))
+#     inner()
+#     return graph
 
+graph = {}
+def build_graph(directory="."):
+    
+    path = pathlib.Path(directory)
+    graph[str(path)] = []
+    def inner():
+        for p in path.iterdir():
+            if str(p).startswith(".texam"):
+                continue
+            elif p.is_file():
+                graph[str(directory)].append(str(p))
+            elif p.is_dir():
+                graph[str(directory)].append(str(p))
+                build_graph(str(p))
+    inner()
+    return graph
+
+        
+def write_trees(path: pathlib.Path):
+    tree_graph = build_graph(str(path))
+    reversed_graph = dict(reversed(tree_graph.items()))
+    def write_tree(values):
+        tree_entry = []
+        for v in values:
+            p = pathlib.Path(v)
+            if p.is_file():
+                sha1 = write_blob(v)
+                entry = "blob\x00{} {}".format(sha1, v)
+                tree_entry.append(entry)
+            elif p.is_dir():
+                sha1 = write_tree(reversed_graph[str(p)])
+                entry = "tree\x00{} {}".format(sha1, v)
+                tree_entry.append(entry)
+        data = "\n".join(tree_entry).encode()
+        return hash_object(data, "")
+        
+    for _, v in reversed_graph.items():
+        sha1 = write_tree(v)
+        print(sha1)
+        
 
 argparser = argparse.ArgumentParser(description="CLI for Texam Software")
 argsubparsers = argparser.add_subparsers(title="Commands", dest="command")
@@ -203,10 +228,11 @@ def cmd_init(args):
     print("Initialized empty Git repository in {}".format(repo.path.absolute()))
 
 def cmd_commit(args):
-    tree_hash = write_tree(args.path)
-    with open(HEAD_FILE, "w") as f:
-        f.write(tree_hash)
-        print("Changes have been committed")
+    import pprint
+    print("Committing")
+    # write_trees(pathlib.Path(args.path))
+    # pprint.pprint(build_graph(args.path))
+    write_trees(pathlib.Path(args.path))
 
 def cmd_ls_tree():
     if not HEAD_FILE.exists():
@@ -228,8 +254,6 @@ def main(argv=sys.argv[1:]):
     args = argparser.parse_args(argv)
     if args.command == "init":
         cmd_init(args)
-    elif args.command == "add":
-        cmd_add(args)
     elif args.command == "commit":
         cmd_commit(args)
     elif args.command == "cat-file":
