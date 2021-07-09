@@ -5,8 +5,6 @@ import configparser
 import pathlib
 import hashlib
 import zlib
-import glob
-import getpass
 
 REPO_NAME = ".texam"
 OBJECTS_DIR = pathlib.Path(".texam/objects")
@@ -129,29 +127,8 @@ def read_blob(hash):
         data = full_data[i+1:]
         return data
 
-def write_blobs(path):
-    path = pathlib.Path(path)
-    if not path.is_dir():
-        raise Exception("Path must be a directory")
-    pattern = path / "**" / "*.*"
-    for file in glob.iglob(str(pattern), recursive=True):
-            write_blob(file)
-
-# graph = {}
-# def build_graph(directory="."):
-#     def inner():
-#         path = pathlib.Path(directory)
-#         graph[str(path)] = []
-#         for p in path.iterdir():
-#             graph[str(directory)].append(str(p))
-#             if p.is_dir():
-#                 build_graph(str(p))
-#     inner()
-#     return graph
-
 graph = {}
 def build_graph(directory="."):
-    
     path = pathlib.Path(directory)
     graph[str(path)] = []
     def inner():
@@ -168,8 +145,12 @@ def build_graph(directory="."):
 
         
 def write_trees(path: pathlib.Path):
+    if not OBJECTS_DIR.exists():
+        raise Exception("Invalid Texam Repo")
     tree_graph = build_graph(str(path))
     reversed_graph = dict(reversed(tree_graph.items()))
+    last_tree = ""
+
     def write_tree(values):
         tree_entry = []
         for v in values:
@@ -186,8 +167,16 @@ def write_trees(path: pathlib.Path):
         return hash_object(data, "")
         
     for _, v in reversed_graph.items():
-        sha1 = write_tree(v)
-        print(sha1)
+        last_tree = write_tree(v)
+    return last_tree
+
+def commit(path="."):
+    if not OBJECTS_DIR.exists():
+        raise Exception("Invalid Texam Repo")
+    last_tree = write_trees(pathlib.Path(path))
+    with open(HEAD_FILE, "w") as f:
+        f.write(last_tree)
+    print("Committed to repo")
         
 
 argparser = argparse.ArgumentParser(description="CLI for Texam Software")
@@ -228,11 +217,8 @@ def cmd_init(args):
     print("Initialized empty Git repository in {}".format(repo.path.absolute()))
 
 def cmd_commit(args):
-    import pprint
     print("Committing")
-    # write_trees(pathlib.Path(args.path))
-    # pprint.pprint(build_graph(args.path))
-    write_trees(pathlib.Path(args.path))
+    commit(args.path)
 
 def cmd_ls_tree():
     if not HEAD_FILE.exists():
