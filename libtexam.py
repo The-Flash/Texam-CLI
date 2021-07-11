@@ -5,11 +5,14 @@ import configparser
 import pathlib
 import hashlib
 import zlib
+import getpass
+import requests
 
 REPO_NAME = ".texam"
 OBJECTS_DIR = pathlib.Path(".texam/objects")
 HEAD_FILE = pathlib.Path(".texam/HEAD")
 CONFIG_FILE = pathlib.Path(".texam/config")
+PUSH_URL = "http://127.0.0.1:8000/test/upload/"
 
 class TexamRepo:
     repo_name = REPO_NAME
@@ -52,12 +55,15 @@ class TexamRepo:
         conf.set("user", "username", str(self.username))
         conf.set("user", "password", str(self.password))
         conf.add_section("test-details")
-        conf.set("test-details", "test-id", str(self.test_id))
+        if self.test_id is not None:
+            conf.set("test-details", "test-id", str(self.test_id))
         with open(self.repo_file("config"), "w") as f:
             conf.write(f)
         return conf
 
     def head_create(self):
+        if pathlib.Path(self.repo_file("HEAD")).exists:
+            return
         with open(self.repo_file("HEAD"), "w") as f:
             f.write("{}".format(self.head_name))
 
@@ -69,7 +75,8 @@ def read_config(path=CONFIG_FILE):
     conf = configparser.ConfigParser()
     conf.read(path)
     config["username"] = conf["user"]["username"]
-    config["test_id"] = conf["test-details"]["test-id"]
+    config["password"] = conf["user"]["password"]
+    config["test_id"] = conf["test-details"].get("test-id", None)
     return config
 
 def hash_object(data, obj_type, write=True):
@@ -120,12 +127,12 @@ def read_blob(hash):
     with open(blob, "rb") as f:
         data = f.read()
         full_data = zlib.decompress(data)
-        i = full_data.find(b"\x00")
-        header = full_data[:i]
-        if header != b"blob":
-            raise Exception("Not a blob")
-        data = full_data[i+1:]
-        return data
+        # i = full_data.find(b"\x00")
+        # header = full_data[:i]
+        # if header != b"blob":
+        #     raise Exception("Not a blob")
+        # data = full_data[i+1:]
+        return full_data
 
 graph = {}
 def build_graph(directory="."):
@@ -142,8 +149,7 @@ def build_graph(directory="."):
                 build_graph(str(p))
     inner()
     return graph
-
-        
+  
 def write_trees(path: pathlib.Path):
     if not OBJECTS_DIR.exists():
         raise Exception("Invalid Texam Repo")
@@ -157,27 +163,116 @@ def write_trees(path: pathlib.Path):
             p = pathlib.Path(v)
             if p.is_file():
                 sha1 = write_blob(v)
-                entry = "blob\x00{} {}".format(sha1, v)
+                c_path = pathlib.Path(v).name
+                entry = "blob {} {}".format(sha1, c_path)
                 tree_entry.append(entry)
             elif p.is_dir():
                 sha1 = write_tree(reversed_graph[str(p)])
-                entry = "tree\x00{} {}".format(sha1, v)
+                c_path = pathlib.Path(v).name
+                entry = "tree {} {}".format(sha1, c_path)
                 tree_entry.append(entry)
         data = "\n".join(tree_entry).encode()
-        return hash_object(data, "")
+        return hash_object(data, "tree")
         
     for _, v in reversed_graph.items():
         last_tree = write_tree(v)
     return last_tree
 
+def get_object_parts(path):
+    with open(path, "rb") as f:
+        data = zlib.decompress(f.read())
+        header, body = data.split(b"\x00")
+    return header, body
+
+def is_blob(path):
+    header, _ = get_object_parts(path)
+    return header.startswith(b"blob")
+
+def is_tree(path):
+    header, _ = get_object_parts(path)
+    return header.startswith(b"tree")
+
+def is_commit(path):
+    header, _ = get_object_parts(path)
+    return header.startswith(b"commit")
+
 def commit(path="."):
     if not OBJECTS_DIR.exists():
         raise Exception("Invalid Texam Repo")
     last_tree = write_trees(pathlib.Path(path))
+    conf = read_config()
+    header_entries = []
+    AUTHOR = "AUTHOR {}".format(conf["username"])
+    header_entries.append(AUTHOR)
+    TEST_ID = "TEST_ID {}".format(conf["test_id"])
+    header_entries.append(TEST_ID)
+    HOST = "HOST {}".format(getpass.getuser())
+    header_entries.append(HOST)
+    header = "\n".join(header_entries)
+    commit_hash = hash_object(last_tree.encode(), "commit {}".format(header))
+    print("Last commit", commit_hash)
     with open(HEAD_FILE, "w") as f:
-        f.write(last_tree)
+        f.write(commit_hash)
     print("Committed to repo")
-        
+
+def get_tree_descendants(tree_hash):
+    descendants = []
+
+    def parse_tree(tree_hash):
+        path = OBJECTS_DIR / tree_hash[:2] / tree_hash[2:]
+        _, body = get_object_parts(path)
+        for v in body.decode().split("\n"):
+            if v.startswith("blob"):
+                hash = v.split()[1]
+                p = OBJECTS_DIR / hash[:2] / hash[2:]
+                descendants.append(str(p))
+            elif v.startswith("tree"):
+                hash = v.split()[1]
+                p = OBJECTS_DIR / hash[:2] / hash[2:]
+                descendants.append(str(p))
+                parse_tree(hash)
+    parse_tree(tree_hash)
+    return descendants
+
+def get_commit_objects(commit_hash):
+    commit_path = OBJECTS_DIR / commit_hash[:2] / commit_hash[2:]
+    if not is_commit(commit_path):
+        raise Exception("Not a commit object")
+    objects = []
+    _, commit_tree_b = get_object_parts(commit_path)
+    commit_tree = commit_tree_b.decode()
+    commit_tree_path = OBJECTS_DIR / commit_tree[:2] / commit_tree[2:]
+    objects.extend([str(HEAD_FILE), str(commit_path), str(commit_tree_path)])
+    descendants = get_tree_descendants(commit_tree)
+    objects.extend(descendants)
+    return objects
+
+def push(commit_hash=None):
+    """
+    1. IF NOT HASH IS PASSED, USE MASTER HASH
+    2. IF THE COMMIT DOES NOT EXIST, RAISE EXCEPTION
+    3. GET ALL OBJECTS FROM THE COMMIT TREE TO THE LAST RECURSIVELY
+    """
+    if commit_hash is None:
+        with open(HEAD_FILE) as f:
+            commit_hash = f.read() 
+    commit_path = OBJECTS_DIR / commit_hash[:2] / commit_hash[2:]
+    if not commit_path.exists():
+        raise Exception("Commit object does not exist")
+    conf = read_config()
+    if conf["test_id"] is None:
+        raise Exception("Test ID is not set. Run texam init")
+    request_data = {
+        "index_no": conf["username"],
+        "password": conf["password"],
+        "test_id": conf["test_id"]
+    }
+    objects = get_commit_objects(commit_hash)
+    request_files = [(str(obj), open(obj, "rb")) for obj in objects]
+    # print(request_files)
+    URL = PUSH_URL
+    r = requests.post(URL, data=request_data, files=request_files)
+    print(r.text)
 
 argparser = argparse.ArgumentParser(description="CLI for Texam Software")
 argsubparsers = argparser.add_subparsers(title="Commands", dest="command")
@@ -190,6 +285,7 @@ argsp.add_argument("path",
 )
 argsp.add_argument("--username", "-u", metavar="Index Number", dest="username", nargs="?", required=True, help="Your Index Number")
 argsp.add_argument("--password", "-p", metavar="Password", dest="password", nargs="?", required=True, help="Your Password")
+argsp.add_argument("--test-id", "-t", metavar="Test ID", dest="test_id", help="ID of Test you are taking")
 argsp = argsubparsers.add_parser("add")
 argsp.add_argument("path", 
     metavar="directory", 
@@ -209,15 +305,23 @@ argsp.add_argument("hash",
     nargs="?"
 )
 argsp = argsubparsers.add_parser("push")
+argsp.add_argument("hash", 
+    metavar="hash", 
+    nargs="?"
+)
+argsp = argsubparsers.add_parser("cat-file")
+argsp.add_argument("hash", 
+    metavar="hash", 
+    nargs="?"
+)
 argsp = argsubparsers.add_parser("ls-tree")
 
 def cmd_init(args):
-    repo = TexamRepo(path=args.path, username=args.username, password=args.password)
+    repo = TexamRepo(path=args.path, username=args.username, password=args.password, test_id=args.test_id)
     repo.initialize()
     print("Initialized empty Git repository in {}".format(repo.path.absolute()))
 
 def cmd_commit(args):
-    print("Committing")
     commit(args.path)
 
 def cmd_ls_tree():
@@ -234,7 +338,7 @@ def cmd_cat_file(args):
     print(read_blob(args.hash))
         
 def cmd_push(args):
-    pass
+    push(args.hash)
     
 def main(argv=sys.argv[1:]):
     args = argparser.parse_args(argv)
@@ -245,7 +349,6 @@ def main(argv=sys.argv[1:]):
     elif args.command == "cat-file":
         cmd_cat_file(args)
     elif args.command == "push":
-        print("Pushing to a remote server")
         cmd_push(args)
     elif args.command == "ls-tree":
         cmd_ls_tree()
