@@ -181,7 +181,7 @@ def write_trees(path: pathlib.Path):
 def get_object_parts(path):
     with open(path, "rb") as f:
         data = zlib.decompress(f.read())
-        header, body = data.split(b"\x00")
+        header, body = data.split(b"\x00",maxsplit=1)
     return header, body
 
 def is_blob(path):
@@ -262,16 +262,16 @@ def push(commit_hash=None):
     conf = read_config()
     if conf["test_id"] is None:
         raise Exception("Test ID is not set. Run texam init")
+    
+    objects = get_commit_objects(commit_hash)
     request_data = {
+        # "csrfmiddlewaretoken": r.cookies["csrftoken"],
         "index_no": conf["username"],
         "password": conf["password"],
         "test_id": conf["test_id"]
     }
-    objects = get_commit_objects(commit_hash)
     request_files = [(str(obj), open(obj, "rb")) for obj in objects]
-    # print(request_files)
-    URL = PUSH_URL
-    r = requests.post(URL, data=request_data, files=request_files)
+    r = requests.post(PUSH_URL, data=request_data, files=request_files)
     print(r.text)
 
 argparser = argparse.ArgumentParser(description="CLI for Texam Software")
